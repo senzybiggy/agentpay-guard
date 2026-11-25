@@ -278,4 +278,185 @@ fn add_and_remove_recipient_updates_allowlist() {
         client.try_add_recipient(&intruder, &recipient),
         Err(Ok(Error::Unauthorized))
     );
+}// --- Stage 4: Payment request submission tests ------------------------------
+
+fn read_request(env: &Env, contract_id: &Address, request_id: u64) -> PaymentRequest {
+    env.as_contract(contract_id, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Request(request_id))
+            .unwrap()
+    })
+}
+
+fn read_spent_today(env: &Env, contract_id: &Address) -> i128 {
+    let today = env.ledger().timestamp() / 86_400;
+    env.as_contract(contract_id, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SpentOnDay(today))
+            .unwrap_or(0)
+    })
+}
+
+#[test]
+fn submit_request_auto_approves_and_reserves_spending() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (owner, agent, contract_id) = create_contract(&env);
+    let recipient = Address::generate(&env);
+    let client = GuardContractClient::new(&env, &contract_id);
+
+    client.add_recipient(&owner, &recipient);
+
+    let amount = 10_000_000_i128;
+    let reason = String::from_str(&env, "Approved payment");
+
+    let id = client.submit_request(&agent, &recipient, &amount, &reason);
+    let request = read_request(&env, &contract_id, id);
+
+    assert_eq!(id, 1);
+    assert_eq!(request.status, Status::AutoApproved);
+    assert_eq!(request.reject_reason, RejectReason::None);
+    assert_eq!(request.counted_amount, amount);
+    assert_eq!(read_spent_today(&env, &contract_id), amount);
+}
+
+#[test]
+fn submit_request_above_auto_limit_remains_pending() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (owner, agent, contract_id) = create_contract(&env);
+    let recipient = Address::generate(&env);
+    let client = GuardContractClient::new(&env, &contract_id);
+
+    client.add_recipient(&owner, &recipient);
+
+    let amount = 100_000_000_i128;
+    let reason = String::from_str(&env, "Requires owner approval");
+
+    let id = client.submit_request(&agent, &recipient, &amount, &reason);
+    let request = read_request(&env, &contract_id, id);
+
+    assert_eq!(request.status, Status::Pending);
+    assert_eq!(request.counted_amount, 0);
+    assert_eq!(read_spent_today(&env, &contract_id), 0);
+}
+
+#[test]
+fn submit_request_rejects_non_allowlisted_recipient() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_owner, agent, contract_id) = create_contract(&env);
+    let recipient = Address::generate(&env);
+    let client = GuardContractClient::new(&env, &contract_id);
+
+    let amount = 10_000_000_i128;
+    let reason = String::from_str(&env, "Unlisted recipient");
+
+    let id = client.submit_request(&agent, &recipient, &amount, &reason);
+    let request = read_request(&env, &contract_id, id);
+
+    assert_eq!(request.status, Status::Rejected);
+    assert_eq!(request.reject_reason, RejectReason::NotAllowlisted);
+    assert_eq!(request.counted_amount, 0);
+}
+
+#[test]
+fn submit_request_rejects_per_transaction_limit() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (owner, agent, contract_id) = create_contract(&env);
+    let recipient = Address::generate(&env);
+    let client = GuardContractClient::new(&env, &contract_id);
+
+    client.add_recipient(&owner, &recipient);
+
+    let amount = 300_000_000_i128;
+    let reason = String::from_str(&env, "Above transaction limit");
+
+    let id = client.submit_request(&agent, &recipient, &amount, &reason);
+    let request = read_request(&env, &contract_id, id);
+
+    assert_eq!(request.status, Status::Rejected);
+    assert_eq!(request.reject_reason, RejectReason::PerTxLimitExceeded);
+}
+
+#[test]
+fn submit_request_rejects_daily_limit_exceeded() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (owner, agent, contract_id) = create_contract(&env);
+    let recipient = Address::generate(&env);
+    let client = GuardContractClient::new(&env, &contract_id);
+
+    client.add_recipient(&owner, &recipient);
+
+    client.set_policy(
+        &owner,
+        &100_000_000,
+        &100_000_000,
+        &50_000_000,
+        &TTL_SECS,
+    );
+
+    let reason = String::from_str(&env, "Daily spending test");
+    let amount = 50_000_000_i128;
+
+    client.submit_request(&agent, &recipient, &amount, &reason);
+    client.submit_request(&agent, &recipient, &amount, &reason);
+
+    assert_eq!(read_spent_today(&env, &contract_id), 100_000_000);
+
+    let third_amount = 1_i128;
+    let id = client.submit_request(&agent, &recipient, &third_amount, &reason);
+    let request = read_request(&env, &contract_id, id);
+
+    assert_eq!(request.status, Status::Rejected);
+    assert_eq!(request.reject_reason, RejectReason::DailyLimitExceeded);
+    assert_eq!(read_spent_today(&env, &contract_id), 100_000_000);
+}
+
+#[test]
+fn submit_request_rejects_unauthorized_agent() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_owner, _agent, contract_id) = create_contract(&env);
+    let intruder = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let client = GuardContractClient::new(&env, &contract_id);
+
+    let amount = 10_000_000_i128;
+    let reason = String::from_str(&env, "Unauthorized request");
+
+    assert_eq!(
+        client.try_submit_request(&intruder, &recipient, &amount, &reason),
+        Err(Ok(Error::Unauthorized))
+    );
+}
+
+#[test]
+fn submit_request_rejects_invalid_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_owner, agent, contract_id) = create_contract(&env);
+    let recipient = Address::generate(&env);
+    let client = GuardContractClient::new(&env, &contract_id);
+
+    let amount = 0_i128;
+    let reason = String::from_str(&env, "Invalid amount");
+
+    assert_eq!(
+        client.try_submit_request(&agent, &recipient, &amount, &reason),
+        Err(Ok(Error::InvalidAmount))
+    );
+
+    assert_eq!(read_next_id(&env, &contract_id), 1);
 }

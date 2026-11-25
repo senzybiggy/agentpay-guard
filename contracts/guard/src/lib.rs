@@ -236,7 +236,20 @@ impl GuardContract {
         }
         owner.require_auth();
         Ok(())
+    }fn require_agent(env: &Env, agent: &Address) -> Result<(), Error> {
+    let stored_agent: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::Agent)
+        .ok_or(Error::NotInitialized)?;
+
+    if *agent != stored_agent {
+        return Err(Error::Unauthorized);
     }
+
+    agent.require_auth();
+    Ok(())
+}
 }
 
 #[contractimpl]
@@ -373,8 +386,126 @@ impl GuardContract {
 
         RecipientRemoved { recipient, owner }.publish(&env);
 
-        Ok(())
+        Ok(())}
+   pub fn submit_request(
+    env: Env,
+    agent: Address,
+    recipient: Address,
+    amount: i128,
+    reason: String,
+) -> Result<u64, Error> {
+    // Verify the registered agent.
+    Self::require_agent(&env, &agent)?;
+
+    // Reject malformed requests without creating a record.
+    if amount <= 0 {
+        return Err(Error::InvalidAmount);
+    }
+
+    if reason.len() > 128 {
+        return Err(Error::ReasonTooLong);
+    }
+
+    let policy: Policy = env
+        .storage()
+        .instance()
+        .get(&DataKey::Policy)
+        .ok_or(Error::NotInitialized)?;
+
+    let request_id: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::NextId)
+        .ok_or(Error::NotInitialized)?;
+
+    let now = env.ledger().timestamp();
+    let today = now / 86_400;
+
+    let spent: i128 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::SpentOnDay(today))
+        .unwrap_or(0);
+
+    // Evaluate policy in the agreed order.
+    let reject_reason = if !env.storage().persistent().get::<_, bool>(
+        &DataKey::Allowlist(recipient.clone())
+    ).unwrap_or(false) {
+        RejectReason::NotAllowlisted
+    } else if amount > policy.per_tx_limit {
+        RejectReason::PerTxLimitExceeded
+    } else if spent.checked_add(amount).map_or(true, |total| total > policy.daily_limit) {
+        RejectReason::DailyLimitExceeded
+    } else {
+        RejectReason::None
+    };
+
+    let status = if reject_reason != RejectReason::None {
+        Status::Rejected
+    } else if amount <= policy.auto_approve_limit {
+        Status::AutoApproved
+    } else {
+        Status::Pending
+    };
+
+    // Reserve spending only for automatic approvals.
+    let counted_amount = if status == Status::AutoApproved {
+        let new_spent = spent.checked_add(amount).ok_or(Error::InvalidAmount)?;
+
+        let key = DataKey::SpentOnDay(today);
+        env.storage().persistent().set(&key, &new_spent);
+        env.storage().persistent().extend_ttl(&key, 100_000, 200_000);
+
+        amount
+    } else {
+        0
+    };
+
+    let request = PaymentRequest {
+        id: request_id,
+        agent: agent.clone(),
+        recipient: recipient.clone(),
+        amount,
+        reason,
+        status: status.clone(),
+        reject_reason: reject_reason.clone(),
+        created_at: now,
+        expires_at: now.saturating_add(policy.approval_ttl_secs),
+        counted_day: if counted_amount > 0 { today } else { 0 },
+        counted_amount,
+        attested_not_executed: false,
+        tx_hash: None,
+    };
+
+    let request_key = DataKey::Request(request_id);
+    env.storage().persistent().set(&request_key, &request);
+    env.storage().persistent().extend_ttl(&request_key, 100_000, 200_000);
+
+    env.storage()
+        .instance()
+        .set(&DataKey::NextId, &(request_id + 1));
+
+    RequestSubmitted {
+        request_id,
+        agent,
+        recipient,
+        amount,
+        status: status.clone(),
+    }
+    .publish(&env);
+
+    if reject_reason != RejectReason::None {
+        RequestRejected {
+            request_id,
+            reason: reject_reason,
+            amount,
+        }
+        .publish(&env);
+    }
+
+    Ok(request_id)
     }
 }
+
 #[cfg(test)]
 mod test;
