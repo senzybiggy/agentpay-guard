@@ -4,10 +4,9 @@ use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, String,
 };
 
-/// Spending policy set by the owner. Owner and agent addresses are stored
-/// separately (see DataKey::Owner / DataKey::Agent); this struct holds
-/// only the limits and the approval time-to-live.
-/// All amounts are in stroops (1 XLM = 10_000_000 stroops).
+const TTL_THRESHOLD: u32 = 100_000;
+const TTL_EXTEND_TO: u32 = 200_000;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Policy {
@@ -17,8 +16,6 @@ pub struct Policy {
     pub approval_ttl_secs: u64,
 }
 
-/// Lifecycle of a payment request. Terminal states (no further
-/// transitions allowed): Rejected, Cancelled, Expired, Executed.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Status {
@@ -31,8 +28,6 @@ pub enum Status {
     Executed,
 }
 
-/// Machine-readable reason stored on a request when it is rejected.
-/// The frontend maps these to human-readable text.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RejectReason {
@@ -43,7 +38,6 @@ pub enum RejectReason {
     OwnerRejected,
 }
 
-/// A single agent payment request and its full decision record.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaymentRequest {
@@ -56,20 +50,12 @@ pub struct PaymentRequest {
     pub reject_reason: RejectReason,
     pub created_at: u64,
     pub expires_at: u64,
-    /// Day bucket (ledger timestamp / 86400) that this request's
-    /// reservation was counted against. 0 if never counted.
     pub counted_day: u64,
-    /// Amount reserved against counted_day. 0 if never counted.
     pub counted_amount: i128,
-    /// Set when an approved request is cancelled with the owner's
-    /// attestation that the payment was not executed.
     pub attested_not_executed: bool,
-    /// Classic Stellar transaction hash, set by mark_executed.
     pub tx_hash: Option<String>,
 }
 
-/// Storage keys. Owner, Agent, Policy and NextId live in instance
-/// storage; Request, Allowlist and SpentOnDay live in persistent storage.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
@@ -82,9 +68,6 @@ pub enum DataKey {
     SpentOnDay(u64),
 }
 
-/// Contract errors. Malformed or invalid operations return these;
-/// policy violations do NOT — they are recorded as rejected requests.
-/// Numbering is frozen once published: do not renumber.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -100,15 +83,6 @@ pub enum Error {
     InvalidTxHash = 9,
     RequestExpired = 10,
 }
-
-// ---------------------------------------------------------------------------
-// Events (Stage 2)
-//
-// Events are the live activity feed only. Stored PaymentRequest records
-// remain the source of truth for history, because Soroban RPC event
-// retention is limited. Fields marked #[topic] are indexed topics;
-// all other fields are published in the event data map.
-// ---------------------------------------------------------------------------
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -204,6 +178,7 @@ pub struct RequestExecuted {
 
 #[contract]
 pub struct GuardContract;
+
 impl GuardContract {
     fn validate_policy(
         per_tx_limit: i128,
@@ -236,20 +211,30 @@ impl GuardContract {
         }
         owner.require_auth();
         Ok(())
-    }fn require_agent(env: &Env, agent: &Address) -> Result<(), Error> {
-    let stored_agent: Address = env
-        .storage()
-        .instance()
-        .get(&DataKey::Agent)
-        .ok_or(Error::NotInitialized)?;
-
-    if *agent != stored_agent {
-        return Err(Error::Unauthorized);
     }
 
-    agent.require_auth();
-    Ok(())
-}
+    fn require_agent(env: &Env, agent: &Address) -> Result<(), Error> {
+        let stored_agent: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Agent)
+            .ok_or(Error::NotInitialized)?;
+
+        if *agent != stored_agent {
+            return Err(Error::Unauthorized);
+        }
+
+        agent.require_auth();
+        Ok(())
+    }
+
+    fn save_request(env: &Env, request: &PaymentRequest) {
+        let key = DataKey::Request(request.id);
+        env.storage().persistent().set(&key, request);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
 }
 
 #[contractimpl]
@@ -362,11 +347,9 @@ impl GuardContract {
         let key = DataKey::Allowlist(recipient.clone());
 
         env.storage().persistent().set(&key, &true);
-        env.storage().persistent().extend_ttl(
-            &key,
-            100_000,
-            200_000,
-        );
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
         RecipientAdded { recipient, owner }.publish(&env);
 
@@ -386,124 +369,464 @@ impl GuardContract {
 
         RecipientRemoved { recipient, owner }.publish(&env);
 
-        Ok(())}
-   pub fn submit_request(
-    env: Env,
-    agent: Address,
-    recipient: Address,
-    amount: i128,
-    reason: String,
-) -> Result<u64, Error> {
-    // Verify the registered agent.
-    Self::require_agent(&env, &agent)?;
-
-    // Reject malformed requests without creating a record.
-    if amount <= 0 {
-        return Err(Error::InvalidAmount);
+        Ok(())
     }
 
-    if reason.len() > 128 {
-        return Err(Error::ReasonTooLong);
-    }
+    pub fn submit_request(
+        env: Env,
+        agent: Address,
+        recipient: Address,
+        amount: i128,
+        reason: String,
+    ) -> Result<u64, Error> {
+        Self::require_agent(&env, &agent)?;
 
-    let policy: Policy = env
-        .storage()
-        .instance()
-        .get(&DataKey::Policy)
-        .ok_or(Error::NotInitialized)?;
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
 
-    let request_id: u64 = env
-        .storage()
-        .instance()
-        .get(&DataKey::NextId)
-        .ok_or(Error::NotInitialized)?;
+        if reason.len() > 128 {
+            return Err(Error::ReasonTooLong);
+        }
 
-    let now = env.ledger().timestamp();
-    let today = now / 86_400;
+        let policy: Policy = env
+            .storage()
+            .instance()
+            .get(&DataKey::Policy)
+            .ok_or(Error::NotInitialized)?;
 
-    let spent: i128 = env
-        .storage()
-        .persistent()
-        .get(&DataKey::SpentOnDay(today))
-        .unwrap_or(0);
+        let request_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextId)
+            .ok_or(Error::NotInitialized)?;
 
-    // Evaluate policy in the agreed order.
-    let reject_reason = if !env.storage().persistent().get::<_, bool>(
-        &DataKey::Allowlist(recipient.clone())
-    ).unwrap_or(false) {
-        RejectReason::NotAllowlisted
-    } else if amount > policy.per_tx_limit {
-        RejectReason::PerTxLimitExceeded
-    } else if spent.checked_add(amount).map_or(true, |total| total > policy.daily_limit) {
-        RejectReason::DailyLimitExceeded
-    } else {
-        RejectReason::None
-    };
+        let now = env.ledger().timestamp();
+        let today = now / 86_400;
 
-    let status = if reject_reason != RejectReason::None {
-        Status::Rejected
-    } else if amount <= policy.auto_approve_limit {
-        Status::AutoApproved
-    } else {
-        Status::Pending
-    };
+        let spent: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SpentOnDay(today))
+            .unwrap_or(0);
 
-    // Reserve spending only for automatic approvals.
-    let counted_amount = if status == Status::AutoApproved {
-        let new_spent = spent.checked_add(amount).ok_or(Error::InvalidAmount)?;
+        let reject_reason = if !env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Allowlist(recipient.clone()))
+            .unwrap_or(false)
+        {
+            RejectReason::NotAllowlisted
+        } else if amount > policy.per_tx_limit {
+            RejectReason::PerTxLimitExceeded
+        } else if spent
+            .checked_add(amount)
+            .map_or(true, |total| total > policy.daily_limit)
+        {
+            RejectReason::DailyLimitExceeded
+        } else {
+            RejectReason::None
+        };
 
-        let key = DataKey::SpentOnDay(today);
-        env.storage().persistent().set(&key, &new_spent);
-        env.storage().persistent().extend_ttl(&key, 100_000, 200_000);
+        let status = if reject_reason != RejectReason::None {
+            Status::Rejected
+        } else if amount <= policy.auto_approve_limit {
+            Status::AutoApproved
+        } else {
+            Status::Pending
+        };
 
-        amount
-    } else {
-        0
-    };
+        let counted_amount = if status == Status::AutoApproved {
+            let new_spent = spent.checked_add(amount).ok_or(Error::InvalidAmount)?;
+            let key = DataKey::SpentOnDay(today);
 
-    let request = PaymentRequest {
-        id: request_id,
-        agent: agent.clone(),
-        recipient: recipient.clone(),
-        amount,
-        reason,
-        status: status.clone(),
-        reject_reason: reject_reason.clone(),
-        created_at: now,
-        expires_at: now.saturating_add(policy.approval_ttl_secs),
-        counted_day: if counted_amount > 0 { today } else { 0 },
-        counted_amount,
-        attested_not_executed: false,
-        tx_hash: None,
-    };
+            env.storage().persistent().set(&key, &new_spent);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
 
-    let request_key = DataKey::Request(request_id);
-    env.storage().persistent().set(&request_key, &request);
-    env.storage().persistent().extend_ttl(&request_key, 100_000, 200_000);
+            amount
+        } else {
+            0
+        };
 
-    env.storage()
-        .instance()
-        .set(&DataKey::NextId, &(request_id + 1));
-
-    RequestSubmitted {
-        request_id,
-        agent,
-        recipient,
-        amount,
-        status: status.clone(),
-    }
-    .publish(&env);
-
-    if reject_reason != RejectReason::None {
-        RequestRejected {
-            request_id,
-            reason: reject_reason,
+        let request = PaymentRequest {
+            id: request_id,
+            agent: agent.clone(),
+            recipient: recipient.clone(),
             amount,
+            reason,
+            status: status.clone(),
+            reject_reason: reject_reason.clone(),
+            created_at: now,
+            expires_at: now.saturating_add(policy.approval_ttl_secs),
+            counted_day: if counted_amount > 0 { today } else { 0 },
+            counted_amount,
+            attested_not_executed: false,
+            tx_hash: None,
+        };
+
+        Self::save_request(&env, &request);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::NextId, &(request_id + 1));
+
+        RequestSubmitted {
+            request_id,
+            agent,
+            recipient,
+            amount,
+            status: status.clone(),
         }
         .publish(&env);
+
+        if reject_reason != RejectReason::None {
+            RequestRejected {
+                request_id,
+                reason: reject_reason,
+                amount,
+            }
+            .publish(&env);
+        }
+
+        Ok(request_id)
     }
 
-    Ok(request_id)
+    pub fn approve_request(
+        env: Env,
+        owner: Address,
+        request_id: u64,
+    ) -> Result<Status, Error> {
+        Self::require_owner(&env, &owner)?;
+
+        let mut request: PaymentRequest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Request(request_id))
+            .ok_or(Error::RequestNotFound)?;
+
+        if request.status != Status::Pending {
+            return Err(Error::InvalidStatus);
+        }
+
+        let now = env.ledger().timestamp();
+
+        if now >= request.expires_at {
+            return Err(Error::RequestExpired);
+        }
+
+        let policy: Policy = env
+            .storage()
+            .instance()
+            .get(&DataKey::Policy)
+            .ok_or(Error::NotInitialized)?;
+
+        let today = now / 86_400;
+
+        let spent_today: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SpentOnDay(today))
+            .unwrap_or(0);
+
+        let allowed: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Allowlist(request.recipient.clone()))
+            .unwrap_or(false);
+
+        let reject_reason = if !allowed {
+            Some(RejectReason::NotAllowlisted)
+        } else if request.amount > policy.per_tx_limit {
+            Some(RejectReason::PerTxLimitExceeded)
+        } else if spent_today
+            .checked_add(request.amount)
+            .map_or(true, |total| total > policy.daily_limit)
+        {
+            Some(RejectReason::DailyLimitExceeded)
+        } else {
+            None
+        };
+
+        if let Some(reason) = reject_reason {
+            request.status = Status::Rejected;
+            request.reject_reason = reason.clone();
+
+            Self::save_request(&env, &request);
+
+            RequestRejected {
+                request_id,
+                reason,
+                amount: request.amount,
+            }
+            .publish(&env);
+
+            return Ok(Status::Rejected);
+        }
+
+        let new_spent = spent_today
+            .checked_add(request.amount)
+            .ok_or(Error::InvalidAmount)?;
+
+        let spent_key = DataKey::SpentOnDay(today);
+
+        env.storage()
+            .persistent()
+            .set(&spent_key, &new_spent);
+
+        env.storage()
+            .persistent()
+            .extend_ttl(&spent_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+
+        request.status = Status::Approved;
+        request.counted_day = today;
+        request.counted_amount = request.amount;
+
+        Self::save_request(&env, &request);
+
+        RequestApproved {
+            request_id,
+            owner,
+            amount: request.amount,
+        }
+        .publish(&env);
+
+        Ok(Status::Approved)
+    }
+
+    pub fn reject_request(
+        env: Env,
+        owner: Address,
+        request_id: u64,
+    ) -> Result<Status, Error> {
+        Self::require_owner(&env, &owner)?;
+
+        let mut request: PaymentRequest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Request(request_id))
+            .ok_or(Error::RequestNotFound)?;
+
+        if request.status != Status::Pending {
+            return Err(Error::InvalidStatus);
+        }
+
+        request.status = Status::Rejected;
+        request.reject_reason = RejectReason::OwnerRejected;
+
+        Self::save_request(&env, &request);
+
+        RequestRejected {
+            request_id,
+            reason: RejectReason::OwnerRejected,
+            amount: request.amount,
+        }
+        .publish(&env);
+
+        Ok(Status::Rejected)
+    }
+
+    // STAGE 6: CANCELLATION, EXPIRY AND EXECUTION
+
+    pub fn cancel_approved(
+        env: Env,
+        owner: Address,
+        request_id: u64,
+        not_executed: bool,
+    ) -> Result<Status, Error> {
+        Self::require_owner(&env, &owner)?;
+
+        if !not_executed {
+            return Err(Error::AttestationRequired);
+        }
+
+        let mut request: PaymentRequest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Request(request_id))
+            .ok_or(Error::RequestNotFound)?;
+
+        if request.status != Status::Approved
+            && request.status != Status::AutoApproved
+        {
+            return Err(Error::InvalidStatus);
+        }
+
+        let released_amount = request.counted_amount;
+
+        if released_amount > 0 {
+            let spent_key = DataKey::SpentOnDay(request.counted_day);
+
+            let spent: i128 = env
+                .storage()
+                .persistent()
+                .get(&spent_key)
+                .unwrap_or(0);
+
+            let remaining = spent
+                .checked_sub(released_amount)
+                .ok_or(Error::InvalidAmount)?;
+
+            env.storage()
+                .persistent()
+                .set(&spent_key, &remaining);
+
+            env.storage()
+                .persistent()
+                .extend_ttl(&spent_key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        }
+
+        request.status = Status::Cancelled;
+        request.attested_not_executed = true;
+
+        Self::save_request(&env, &request);
+
+        RequestCancelled {
+            request_id,
+            owner,
+            attested_not_executed: true,
+            released_amount,
+        }
+        .publish(&env);
+
+        Ok(Status::Cancelled)
+    }
+
+    pub fn expire_request(
+        env: Env,
+        actor: Address,
+        request_id: u64,
+    ) -> Result<Status, Error> {
+        let owner = Self::stored_owner(&env)?;
+
+        let agent: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Agent)
+            .ok_or(Error::NotInitialized)?;
+
+        if actor != owner && actor != agent {
+            return Err(Error::Unauthorized);
+        }
+
+        actor.require_auth();
+
+        let mut request: PaymentRequest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Request(request_id))
+            .ok_or(Error::RequestNotFound)?;
+
+        if request.status != Status::Pending {
+            return Err(Error::InvalidStatus);
+        }
+
+        let now = env.ledger().timestamp();
+
+        if now < request.expires_at {
+            return Err(Error::InvalidStatus);
+        }
+
+        request.status = Status::Expired;
+
+        Self::save_request(&env, &request);
+
+        RequestExpired {
+            request_id,
+            previous_status: Status::Pending,
+        }
+        .publish(&env);
+
+        Ok(Status::Expired)
+    }
+
+    pub fn mark_executed(
+        env: Env,
+        owner: Address,
+        request_id: u64,
+        tx_hash: String,
+    ) -> Result<Status, Error> {
+        Self::require_owner(&env, &owner)?;
+
+        if tx_hash.len() == 0 || tx_hash.len() > 128 {
+            return Err(Error::InvalidTxHash);
+        }
+
+        let mut request: PaymentRequest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Request(request_id))
+            .ok_or(Error::RequestNotFound)?;
+
+        if request.status != Status::Approved
+            && request.status != Status::AutoApproved
+        {
+            return Err(Error::InvalidStatus);
+        }
+
+        request.status = Status::Executed;
+        request.tx_hash = Some(tx_hash.clone());
+
+        Self::save_request(&env, &request);
+
+        RequestExecuted {
+            request_id,
+            amount: request.amount,
+            tx_hash,
+        }
+        .publish(&env);
+
+        Ok(Status::Executed)
+    }
+    // STAGE 7: READ-ONLY VIEW FUNCTIONS
+
+    pub fn get_policy(env: Env) -> Result<Policy, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Policy)
+            .ok_or(Error::NotInitialized)
+    }
+
+    pub fn get_request(
+        env: Env,
+        request_id: u64,
+    ) -> Result<PaymentRequest, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Request(request_id))
+            .ok_or(Error::RequestNotFound)
+    }
+
+    pub fn request_count(env: Env) -> Result<u64, Error> {
+        let next_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextId)
+            .ok_or(Error::NotInitialized)?;
+
+        Ok(next_id.saturating_sub(1))
+    }
+
+    pub fn spent_today(env: Env) -> Result<i128, Error> {
+        let today = env.ledger().timestamp() / 86_400;
+
+        Ok(env
+            .storage()
+            .persistent()
+            .get(&DataKey::SpentOnDay(today))
+            .unwrap_or(0))
+    }
+
+    pub fn is_allowed(
+        env: Env,
+        recipient: Address,
+    ) -> Result<bool, Error> {
+        Ok(env
+            .storage()
+            .persistent()
+            .get(&DataKey::Allowlist(recipient))
+            .unwrap_or(false))
     }
 }
 
