@@ -320,6 +320,33 @@ fn set_agent_rotates_agent_and_rejects_non_owner() {
 }
 
 #[test]
+#[should_panic]
+fn constructor_rejects_agent_equal_to_owner() {
+    let env = Env::default();
+    let owner = Address::generate(&env);
+
+    env.register(
+        GuardContract,
+        (owner.clone(), owner, PER_TX, DAILY, AUTO, TTL_SECS),
+    );
+}
+
+#[test]
+fn set_agent_rejects_owner_as_agent() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (owner, agent, contract_id) = create_contract(&env);
+    let client = GuardContractClient::new(&env, &contract_id);
+
+    assert_eq!(
+        client.try_set_agent(&owner, &owner),
+        Err(Ok(Error::Unauthorized))
+    );
+
+    assert_eq!(read_agent(&env, &contract_id), agent);
+}
+
+#[test]
 fn add_and_remove_recipient_updates_allowlist() {
     let env = Env::default();
     env.mock_all_auths();

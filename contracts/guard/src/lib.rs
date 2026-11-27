@@ -250,6 +250,10 @@ impl GuardContract {
     ) -> Result<(), Error> {
         owner.require_auth();
 
+        if agent == owner {
+            return Err(Error::Unauthorized);
+        }
+
         Self::validate_policy(
             per_tx_limit,
             daily_limit,
@@ -325,6 +329,10 @@ impl GuardContract {
         new_agent: Address,
     ) -> Result<(), Error> {
         Self::require_owner(&env, &owner)?;
+
+        if new_agent == owner {
+            return Err(Error::Unauthorized);
+        }
 
         env.storage().instance().set(&DataKey::Agent, &new_agent);
 
